@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 import gi
@@ -56,6 +57,11 @@ class AppConfig:
     # Hotkey mode: "toggle" (one key) or "start_stop" (separate keys)
     hotkey_mode: str = "toggle"
 
+    # Night mode — suppress beeps between these hours (24h format)
+    night_mode: bool = True
+    night_start: int = 22  # 10 PM
+    night_end: int = 9     # 9 AM
+
     # Hotkey bindings (pynput format, e.g. "<ctrl>+0", "<alt>+d")
     hotkey_toggle: str = "<ctrl>+0"
     hotkey_start: str = "<ctrl>+9"
@@ -99,18 +105,40 @@ def _generate_tone(freq: float, duration: float, volume: float) -> np.ndarray:
     return tone
 
 
+def _is_night_mode(config: "AppConfig") -> bool:
+    """Check if current time falls within night mode hours."""
+    if not config.night_mode:
+        return False
+    hour = datetime.now().hour
+    if config.night_start > config.night_end:
+        # Wraps midnight: e.g. 22-9 means 22,23,0,1,...,8
+        return hour >= config.night_start or hour < config.night_end
+    else:
+        return config.night_start <= hour < config.night_end
+
+
+# Global config ref for beep functions (set in main)
+_active_config: "AppConfig | None" = None
+
+
 def play_beep_start(volume: float = 0.5):
     """Rising tone — dictation started."""
+    if _active_config and _is_night_mode(_active_config):
+        return
     sd.play(_generate_tone(880, 0.15, volume), samplerate=SAMPLE_RATE)
 
 
 def play_beep_stop(volume: float = 0.5):
     """Falling tone — dictation stopped."""
+    if _active_config and _is_night_mode(_active_config):
+        return
     sd.play(_generate_tone(440, 0.15, volume), samplerate=SAMPLE_RATE)
 
 
 def play_beep_pause(volume: float = 0.5):
     """Double short beep — paused/resumed."""
+    if _active_config and _is_night_mode(_active_config):
+        return
     t1 = _generate_tone(660, 0.07, volume)
     gap = np.zeros(int(SAMPLE_RATE * 0.05), dtype=np.float32)
     t2 = _generate_tone(660, 0.07, volume)
@@ -440,6 +468,10 @@ class DictationController:
     def profiles(self) -> dict:
         return self._profiles_data["profiles"]
 
+    @property
+    def profiles_data(self) -> dict:
+        return self._profiles_data
+
     def start(self):
         if not self._engine.is_running:
             self._engine.start()
@@ -579,115 +611,375 @@ class HotkeyCaptureButton(Gtk.Button):
 
 
 # ---------------------------------------------------------------------------
-# Settings dialog
+# Settings dialog (tabbed: Models, Hotkeys, About)
 # ---------------------------------------------------------------------------
 
+def _is_model_downloaded(model_id: str, profiles: dict) -> bool:
+    """Check if all files for a model are present on disk."""
+    profile = profiles.get(model_id)
+    if not profile:
+        return False
+    model_dir = MODELS_DIR / model_id
+    for key, info in profile.get("files", {}).items():
+        if not (model_dir / info["filename"]).exists():
+            return False
+    vad_path = MODELS_DIR / "silero_vad.onnx"
+    return vad_path.exists()
+
+
+def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
+    """Download a model in a background thread."""
+    import requests
+
+    def _worker():
+        try:
+            profile = profiles_data["profiles"][model_id]
+            model_dir = MODELS_DIR / model_id
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download VAD if missing
+            vad_path = MODELS_DIR / "silero_vad.onnx"
+            if not vad_path.exists():
+                GLib.idle_add(on_progress, "Downloading VAD model...")
+                vad = profiles_data["vad"]
+                resp = requests.get(vad["url"], stream=True, timeout=30)
+                resp.raise_for_status()
+                with open(vad_path, "wb") as f:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        f.write(chunk)
+
+            # Download model files
+            files = profile["files"]
+            total_files = len(files)
+            for i, (key, info) in enumerate(files.items(), 1):
+                dest = model_dir / info["filename"]
+                if dest.exists() and dest.stat().st_size > 0:
+                    continue
+                GLib.idle_add(on_progress, f"Downloading {info['filename']} ({i}/{total_files})...")
+                resp = requests.get(info["url"], stream=True, timeout=30)
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        f.write(chunk)
+
+            GLib.idle_add(on_done, True, "")
+        except Exception as e:
+            GLib.idle_add(on_done, False, str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 class SettingsDialog(Gtk.Dialog):
-    def __init__(self, config: AppConfig, profiles: dict, on_save):
+    def __init__(self, config: AppConfig, profiles_data: dict, on_save):
         super().__init__(title=f"{APP_NAME} — Settings", flags=0)
         self._config = config
-        self._profiles = profiles
+        self._profiles_data = profiles_data
+        self._profiles = profiles_data["profiles"]
         self._on_save = on_save
-        self.set_default_size(450, 520)
+        self.set_default_size(520, 560)
 
-        box = self.get_content_area()
-        box.set_spacing(8)
+        notebook = Gtk.Notebook()
+        self.get_content_area().pack_start(notebook, True, True, 0)
+
+        notebook.append_page(self._build_models_tab(), Gtk.Label(label="Models"))
+        notebook.append_page(self._build_hotkeys_tab(), Gtk.Label(label="Hotkeys"))
+        notebook.append_page(self._build_general_tab(), Gtk.Label(label="General"))
+        notebook.append_page(self._build_about_tab(), Gtk.Label(label="About"))
+
+        self.show_all()
+
+    # --- Models tab ---
+
+    def _build_models_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_margin_start(16)
         box.set_margin_end(16)
-        box.set_margin_top(16)
-        box.set_margin_bottom(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
 
-        # --- Model profile ---
-        self._add_section(box, "Model")
-        self._profile_combo = Gtk.ComboBoxText()
-        for pid, pdata in profiles.items():
-            label = f"{pdata['name']} ({pdata['params']}, {pdata['size_mb']} MB)"
-            if pdata.get("streaming"):
-                label += " [streaming]"
-            self._profile_combo.append(pid, label)
-        self._profile_combo.set_active_id(config.model_profile)
-        box.pack_start(self._profile_combo, False, False, 0)
+        self._model_status_label = Gtk.Label()
+        self._model_status_label.set_halign(Gtk.Align.START)
+        box.pack_start(self._model_status_label, False, False, 0)
 
-        # --- Hotkey mode ---
-        self._add_section(box, "Hotkey Mode")
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._model_list = Gtk.ListBox()
+        self._model_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        sw.add(self._model_list)
+        box.pack_start(sw, True, True, 0)
+
+        self._populate_models()
+        return box
+
+    def _populate_models(self):
+        for child in self._model_list.get_children():
+            self._model_list.remove(child)
+
+        active = self._config.model_profile
+        self._model_status_label.set_markup(
+            f"Active: <b>{self._profiles.get(active, {}).get('name', active)}</b>"
+        )
+
+        for mid, mdata in self._profiles.items():
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            hbox.set_margin_start(8)
+            hbox.set_margin_end(8)
+            hbox.set_margin_top(6)
+            hbox.set_margin_bottom(6)
+
+            # Info column
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            name_label = Gtk.Label()
+            name_label.set_markup(f"<b>{mdata['name']}</b>")
+            name_label.set_halign(Gtk.Align.START)
+            vbox.pack_start(name_label, False, False, 0)
+
+            desc = mdata.get("description", "")
+            desc_label = Gtk.Label(label=desc)
+            desc_label.set_halign(Gtk.Align.START)
+            desc_label.set_line_wrap(True)
+            desc_label.set_max_width_chars(50)
+            desc_label.get_style_context().add_class("dim-label")
+            vbox.pack_start(desc_label, False, False, 0)
+
+            tags = f"{mdata['params']} params · {mdata['size_mb']} MB"
+            if mdata.get("streaming"):
+                tags += " · streaming"
+            tag_label = Gtk.Label(label=tags)
+            tag_label.set_halign(Gtk.Align.START)
+            tag_label.get_style_context().add_class("dim-label")
+            vbox.pack_start(tag_label, False, False, 0)
+
+            hbox.pack_start(vbox, True, True, 0)
+
+            # Buttons column
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            btn_box.set_valign(Gtk.Align.CENTER)
+
+            downloaded = _is_model_downloaded(mid, self._profiles)
+            is_active = (mid == active)
+
+            if downloaded:
+                if is_active:
+                    active_label = Gtk.Label(label="Active")
+                    active_label.get_style_context().add_class("dim-label")
+                    btn_box.pack_start(active_label, False, False, 0)
+                else:
+                    use_btn = Gtk.Button(label="Use")
+                    use_btn.connect("clicked", self._on_use_model, mid)
+                    btn_box.pack_start(use_btn, False, False, 0)
+            else:
+                dl_btn = Gtk.Button(label="Download")
+                dl_btn.connect("clicked", self._on_download_model, mid, dl_btn)
+                btn_box.pack_start(dl_btn, False, False, 0)
+
+            hbox.pack_end(btn_box, False, False, 0)
+            row.add(hbox)
+            self._model_list.add(row)
+
+        self._model_list.show_all()
+
+    def _on_use_model(self, _btn, model_id):
+        self._config.model_profile = model_id
+        self._config.save()
+        if self._on_save:
+            self._on_save(self._config)
+        self._populate_models()
+
+    def _on_download_model(self, _btn, model_id, btn_widget):
+        btn_widget.set_sensitive(False)
+        btn_widget.set_label("...")
+
+        def on_progress(msg):
+            btn_widget.set_label(msg[:20])
+
+        def on_done(success, err):
+            if success:
+                self._populate_models()
+            else:
+                btn_widget.set_label("Failed")
+                btn_widget.set_sensitive(True)
+                print(f"Download error: {err}", file=sys.stderr)
+
+        _download_model(model_id, self._profiles_data, on_progress, on_done)
+
+    # --- Hotkeys tab ---
+
+    def _build_hotkeys_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        # Mode
         self._mode_toggle = Gtk.RadioButton.new_with_label(
             None, "Toggle (one key starts and stops)")
         self._mode_startstop = Gtk.RadioButton.new_with_label_from_widget(
             self._mode_toggle, "Start/Stop (separate keys)")
-        if config.hotkey_mode == "start_stop":
+        if self._config.hotkey_mode == "start_stop":
             self._mode_startstop.set_active(True)
         box.pack_start(self._mode_toggle, False, False, 0)
-        box.pack_start(self._mode_startstop, False, False, 0)
+        box.pack_start(self._mode_startstop, False, False, 4)
 
-        # --- Hotkey bindings ---
-        self._add_section(box, "Key Bindings (click to rebind)")
-        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        # Bindings
+        hint = Gtk.Label(label="Click a button, then press your desired key combo.")
+        hint.set_halign(Gtk.Align.START)
+        hint.set_margin_top(8)
+        box.pack_start(hint, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        grid.set_margin_top(4)
 
         grid.attach(Gtk.Label(label="Toggle:", halign=Gtk.Align.END), 0, 0, 1, 1)
-        self._hk_toggle = HotkeyCaptureButton(config.hotkey_toggle)
+        self._hk_toggle = HotkeyCaptureButton(self._config.hotkey_toggle)
         grid.attach(self._hk_toggle, 1, 0, 1, 1)
 
         grid.attach(Gtk.Label(label="Start:", halign=Gtk.Align.END), 0, 1, 1, 1)
-        self._hk_start = HotkeyCaptureButton(config.hotkey_start)
+        self._hk_start = HotkeyCaptureButton(self._config.hotkey_start)
         grid.attach(self._hk_start, 1, 1, 1, 1)
 
         grid.attach(Gtk.Label(label="Stop:", halign=Gtk.Align.END), 0, 2, 1, 1)
-        self._hk_stop = HotkeyCaptureButton(config.hotkey_stop)
+        self._hk_stop = HotkeyCaptureButton(self._config.hotkey_stop)
         grid.attach(self._hk_stop, 1, 2, 1, 1)
 
         grid.attach(Gtk.Label(label="Pause:", halign=Gtk.Align.END), 0, 3, 1, 1)
-        self._hk_pause = HotkeyCaptureButton(config.hotkey_pause)
+        self._hk_pause = HotkeyCaptureButton(self._config.hotkey_pause)
         grid.attach(self._hk_pause, 1, 3, 1, 1)
 
         box.pack_start(grid, False, False, 0)
 
-        # --- General ---
-        self._add_section(box, "General")
+        # Save
+        save_btn = Gtk.Button(label="Save Hotkeys")
+        save_btn.get_style_context().add_class("suggested-action")
+        save_btn.connect("clicked", self._save_hotkeys)
+        save_btn.set_margin_top(12)
+        box.pack_start(save_btn, False, False, 0)
+
+        return box
+
+    def _save_hotkeys(self, _btn):
+        self._config.hotkey_mode = "start_stop" if self._mode_startstop.get_active() else "toggle"
+        self._config.hotkey_toggle = self._hk_toggle.binding
+        self._config.hotkey_start = self._hk_start.binding
+        self._config.hotkey_stop = self._hk_stop.binding
+        self._config.hotkey_pause = self._hk_pause.binding
+        self._config.save()
+        if self._on_save:
+            self._on_save(self._config)
+
+    # --- General tab ---
+
+    def _build_general_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox.pack_start(Gtk.Label(label="Beep volume:"), False, False, 0)
         self._vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
-        self._vol_scale.set_value(config.beep_volume)
+        self._vol_scale.set_value(self._config.beep_volume)
         hbox.pack_start(self._vol_scale, True, True, 0)
         box.pack_start(hbox, False, False, 0)
 
         hbox2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox2.pack_start(Gtk.Label(label="CPU threads:"), False, False, 0)
         self._threads_spin = Gtk.SpinButton.new_with_range(1, 16, 1)
-        self._threads_spin.set_value(config.num_threads)
+        self._threads_spin.set_value(self._config.num_threads)
         hbox2.pack_start(self._threads_spin, False, False, 0)
         box.pack_start(hbox2, False, False, 0)
 
-        # --- Save ---
-        save_btn = Gtk.Button(label="Save & Apply")
+        # Night mode
+        sep = Gtk.Separator()
+        sep.set_margin_top(8)
+        box.pack_start(sep, False, False, 0)
+
+        self._night_check = Gtk.CheckButton(label="Night mode (suppress beeps)")
+        self._night_check.set_active(self._config.night_mode)
+        box.pack_start(self._night_check, False, False, 4)
+
+        hbox3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox3.pack_start(Gtk.Label(label="Quiet hours:"), False, False, 0)
+        self._night_start_spin = Gtk.SpinButton.new_with_range(0, 23, 1)
+        self._night_start_spin.set_value(self._config.night_start)
+        hbox3.pack_start(self._night_start_spin, False, False, 0)
+        hbox3.pack_start(Gtk.Label(label="to"), False, False, 0)
+        self._night_end_spin = Gtk.SpinButton.new_with_range(0, 23, 1)
+        self._night_end_spin.set_value(self._config.night_end)
+        hbox3.pack_start(self._night_end_spin, False, False, 0)
+        box.pack_start(hbox3, False, False, 0)
+
+        save_btn = Gtk.Button(label="Save General")
         save_btn.get_style_context().add_class("suggested-action")
-        save_btn.connect("clicked", self._save)
-        box.pack_end(save_btn, False, False, 8)
+        save_btn.connect("clicked", self._save_general)
+        save_btn.set_margin_top(12)
+        box.pack_start(save_btn, False, False, 0)
 
-        self.show_all()
+        return box
 
-    def _add_section(self, box, title):
-        label = Gtk.Label()
-        label.set_markup(f"<b>{title}</b>")
-        label.set_halign(Gtk.Align.START)
-        label.set_margin_top(8)
-        box.pack_start(label, False, False, 0)
-
-    def _save(self, _btn):
-        new = AppConfig(
-            model_profile=self._profile_combo.get_active_id() or self._config.model_profile,
-            num_threads=int(self._threads_spin.get_value()),
-            vad_threshold=self._config.vad_threshold,
-            beep_volume=self._vol_scale.get_value(),
-            typer=self._config.typer,
-            hotkey_mode="start_stop" if self._mode_startstop.get_active() else "toggle",
-            hotkey_toggle=self._hk_toggle.binding,
-            hotkey_start=self._hk_start.binding,
-            hotkey_stop=self._hk_stop.binding,
-            hotkey_pause=self._hk_pause.binding,
-        )
+    def _save_general(self, _btn):
+        global _active_config
+        self._config.beep_volume = self._vol_scale.get_value()
+        self._config.num_threads = int(self._threads_spin.get_value())
+        self._config.night_mode = self._night_check.get_active()
+        self._config.night_start = int(self._night_start_spin.get_value())
+        self._config.night_end = int(self._night_end_spin.get_value())
+        _active_config = self._config
+        self._config.save()
         if self._on_save:
-            self._on_save(new)
-        self.destroy()
+            self._on_save(self._config)
+
+    # --- About tab ---
+
+    def _build_about_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        about_text = Gtk.Label()
+        about_text.set_markup(
+            f"<b>{APP_NAME}</b>\n\n"
+            "On-device voice typing with punctuation.\n"
+            "Powered by sherpa-onnx + NVIDIA NeMo models.\n\n"
+            "<b>Model recommendations:</b>\n\n"
+            "<b>Parakeet TDT 0.6B v3</b> (639 MB)\n"
+            "Best overall accuracy. Ideal for desktops and workstations.\n"
+            "Works on CPU at ~30x real-time. Even faster with GPU.\n"
+            "Supports 25 European languages.\n\n"
+            "<b>Canary 180M Flash</b> (198 MB)\n"
+            "Lightweight model for laptops and low-RAM machines.\n"
+            "Good accuracy for its size. Supports EN/ES/DE/FR.\n"
+            "Only 198 MB download — ideal for travel.\n\n"
+            "<b>Nemotron Streaming 0.6B</b> (631 MB)\n"
+            "True real-time streaming — text appears as you speak\n"
+            "with no pause needed. English only.\n"
+            "Higher latency tradeoff: slightly less accurate on\n"
+            "sentence boundaries vs. VAD-segmented models.\n\n"
+            "<b>General tips:</b>\n"
+            "• All models include punctuation and capitalization\n"
+            "• Non-streaming models wait for a brief pause, then transcribe\n"
+            "• Streaming model transcribes continuously but may revise text\n"
+            "• More CPU threads = faster transcription (4-8 recommended)\n"
+            "• Pause hotkey mutes mic without unloading model (fast resume)"
+        )
+        about_text.set_halign(Gtk.Align.START)
+        about_text.set_valign(Gtk.Align.START)
+        about_text.set_line_wrap(True)
+        about_text.set_selectable(True)
+        about_text.set_max_width_chars(60)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(about_text)
+        box.pack_start(sw, True, True, 0)
+
+        return box
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +1082,7 @@ class TrayIcon:
     def _on_settings(self, _item):
         SettingsDialog(
             self._controller.config,
-            self._controller.profiles,
+            self._controller.profiles_data,
             on_save=self._apply_settings,
         )
 
@@ -810,7 +1102,9 @@ class TrayIcon:
 # ---------------------------------------------------------------------------
 
 def main():
+    global _active_config
     config = AppConfig.load()
+    _active_config = config
 
     # Auto-detect Wayland vs X11
     session = os.environ.get("XDG_SESSION_TYPE", "")
