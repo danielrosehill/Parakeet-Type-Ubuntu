@@ -1623,11 +1623,20 @@ class MainWindow(Gtk.Window):
         mic_box.pack_start(self._mic_combo, True, True, 0)
         vbox.pack_start(mic_box, False, False, 0)
 
-        # --- Model display ---
-        self._model_label = Gtk.Label()
-        self._model_label.set_halign(Gtk.Align.CENTER)
-        self._model_label.get_style_context().add_class("dim-label")
-        vbox.pack_start(self._model_label, False, False, 0)
+        # --- Model selector ---
+        model_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        model_box.pack_start(Gtk.Label(label="Model:"), False, False, 0)
+        self._model_combo = Gtk.ComboBoxText()
+        for mid, mdata in self._controller.profiles.items():
+            downloaded = _is_model_downloaded(mid, self._controller.profiles)
+            label = mdata["name"]
+            if not downloaded:
+                label += " (not downloaded)"
+            self._model_combo.append(mid, label)
+        self._model_combo.set_active_id(self._controller.config.model_profile)
+        self._model_combo.connect("changed", self._on_model_changed)
+        model_box.pack_start(self._model_combo, True, True, 0)
+        vbox.pack_start(model_box, False, False, 0)
 
         self._update_controls()
 
@@ -1644,6 +1653,21 @@ class MainWindow(Gtk.Window):
         cfg = self._controller.config
         cfg.audio_device = dev_id
         cfg.save()
+
+    def _on_model_changed(self, combo):
+        model_id = combo.get_active_id()
+        if not model_id or model_id == self._controller.config.model_profile:
+            return
+        if not _is_model_downloaded(model_id, self._controller.profiles):
+            self._model_combo.set_active_id(self._controller.config.model_profile)
+            return
+        new_config = self._controller.config
+        new_config.model_profile = model_id
+        self._controller.apply_config(new_config)
+        self._hotkey_mgr.rebuild(new_config)
+        if hasattr(self, "_tray") and self._tray:
+            self._tray._build_menu()
+            self._tray.update_ui()
 
     def _update_controls(self):
         running = self._controller.is_running
@@ -1663,10 +1687,9 @@ class MainWindow(Gtk.Window):
             self._status_label.set_markup("<span size='large'>Idle</span>")
             self._pause_btn.set_sensitive(False)
 
-        profile_name = self._controller.profiles.get(
-            cfg.model_profile, {}
-        ).get("name", cfg.model_profile)
-        self._model_label.set_markup(f"<small>Model: {profile_name}</small>")
+        # Sync model combo if changed externally (e.g. via tray)
+        if self._model_combo.get_active_id() != cfg.model_profile:
+            self._model_combo.set_active_id(cfg.model_profile)
 
     def on_status_update(self, text: str):
         self._update_controls()
@@ -1851,6 +1874,7 @@ def main():
     main_window = MainWindow(controller, hotkey_mgr)
 
     tray = TrayIcon(controller, hotkey_mgr, main_window)
+    main_window._tray = tray  # So model changes from window rebuild tray menu
     hotkey_mgr.start()
 
     signal.signal(signal.SIGINT, lambda *_: (controller.stop(), Gtk.main_quit()))
