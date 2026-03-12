@@ -10,19 +10,22 @@ Usage:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import requests
 from tqdm import tqdm
 
+APP_ID = "parakeet-dictation"
 APP_DIR = Path(__file__).resolve().parent
-MODELS_DIR = APP_DIR / "models"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_ID
+MODELS_DIR = DATA_DIR / "models"
 MODELS_JSON = APP_DIR / "models.json"
 
 
 def download_file(url: str, dest: Path):
-    resp = requests.get(url, stream=True, timeout=30)
+    resp = requests.get(url, stream=True, timeout=(15, 60))
     resp.raise_for_status()
     total = int(resp.headers.get("content-length", 0))
     with open(dest, "wb") as f, tqdm(
