@@ -46,7 +46,7 @@ SAMPLE_RATE = 16000
 class AppConfig:
     # Model
     model_profile: str = "desktop"
-    num_threads: int = 4
+    num_threads: int = min(os.cpu_count() or 4, 8)
     vad_threshold: float = 0.5
 
     # Audio
@@ -785,6 +785,38 @@ def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _download_all_models(profiles_data: dict, on_progress, on_done):
+    """Download all models sequentially in a background thread."""
+    import requests
+
+    def _worker():
+        try:
+            profiles = profiles_data["profiles"]
+            for mid, profile in profiles.items():
+                model_dir = MODELS_DIR / mid
+                model_dir.mkdir(parents=True, exist_ok=True)
+                files = profile["files"]
+                total_files = len(files)
+                for i, (key, info) in enumerate(files.items(), 1):
+                    dest = model_dir / info["filename"]
+                    if dest.exists() and dest.stat().st_size > 0:
+                        continue
+                    GLib.idle_add(
+                        on_progress,
+                        f"{profile['name'][:20]}: {info['filename']} ({i}/{total_files})",
+                    )
+                    resp = requests.get(info["url"], stream=True, timeout=30)
+                    resp.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in resp.iter_content(1024 * 1024):
+                            f.write(chunk)
+            GLib.idle_add(on_done, True, "")
+        except Exception as e:
+            GLib.idle_add(on_done, False, str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 LANG_LABELS = {"en": "English", "es": "Spanish", "de": "German", "fr": "French"}
 
 
@@ -889,7 +921,47 @@ class WelcomeDialog(Gtk.Dialog):
             frame.add(fbox)
             box.pack_start(frame, False, False, 0)
 
+        # Download All button
+        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        dl_all_btn = Gtk.Button()
+        dl_all_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dl_all_hbox.set_halign(Gtk.Align.CENTER)
+        dl_all_hbox.pack_start(
+            Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
+            False, False, 0,
+        )
+        dl_all_hbox.pack_start(
+            Gtk.Label(label=f"Download All Models ({total_mb} MB)"), False, False, 0,
+        )
+        dl_all_btn.add(dl_all_hbox)
+        dl_all_btn.set_margin_top(4)
+        dl_all_btn.connect("clicked", self._on_download_all)
+        box.pack_start(dl_all_btn, False, False, 0)
+
         self.show_all()
+
+    def _on_download_all(self, btn):
+        btn.set_sensitive(False)
+        label = btn.get_children()[0].get_children()[1]
+        label.set_text("Downloading...")
+
+        def on_progress(msg):
+            label.set_text(msg[:40])
+
+        def on_done(success, err):
+            if success:
+                # Pick the best default — laptop if available
+                self._config.model_profile = "laptop"
+                self._config.save()
+                self.destroy()
+                if self._on_model_ready:
+                    self._on_model_ready(self._config)
+            else:
+                btn.set_sensitive(True)
+                label.set_text("Retry Download All")
+                print(f"Download error: {err}", file=sys.stderr)
+
+        _download_all_models(self._profiles_data, on_progress, on_done)
 
     def _on_download(self, _btn, model_id, btn_widget):
         btn_widget.set_sensitive(False)
@@ -952,6 +1024,21 @@ class SettingsDialog(Gtk.Dialog):
         self._model_list.set_selection_mode(Gtk.SelectionMode.NONE)
         sw.add(self._model_list)
         box.pack_start(sw, True, True, 0)
+
+        # Download All button
+        self._dl_all_btn = Gtk.Button()
+        dl_all_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dl_all_hbox.set_halign(Gtk.Align.CENTER)
+        dl_all_hbox.pack_start(
+            Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON),
+            False, False, 0,
+        )
+        total_mb = sum(m["size_mb"] for m in self._profiles.values())
+        self._dl_all_label = Gtk.Label(label=f"Download All Models ({total_mb} MB)")
+        dl_all_hbox.pack_start(self._dl_all_label, False, False, 0)
+        self._dl_all_btn.add(dl_all_hbox)
+        self._dl_all_btn.connect("clicked", self._on_download_all)
+        box.pack_start(self._dl_all_btn, False, False, 0)
 
         self._populate_models()
         return box
@@ -1064,6 +1151,24 @@ class SettingsDialog(Gtk.Dialog):
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_model(model_id, self._profiles_data, on_progress, on_done)
+
+    def _on_download_all(self, _btn):
+        self._dl_all_btn.set_sensitive(False)
+        self._dl_all_label.set_text("Downloading...")
+
+        def on_progress(msg):
+            self._dl_all_label.set_text(msg[:40])
+
+        def on_done(success, err):
+            if success:
+                self._dl_all_label.set_text("All models downloaded")
+                self._populate_models()
+            else:
+                self._dl_all_btn.set_sensitive(True)
+                self._dl_all_label.set_text("Retry Download All")
+                print(f"Download error: {err}", file=sys.stderr)
+
+        _download_all_models(self._profiles_data, on_progress, on_done)
 
     # --- Hotkeys tab ---
 
@@ -1296,12 +1401,27 @@ class TrayIcon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        profile_name = self._controller.profiles.get(
-            cfg.model_profile, {}
-        ).get("name", cfg.model_profile)
-        self._model_item = Gtk.MenuItem(label=f"Model: {profile_name}")
-        self._model_item.set_sensitive(False)
-        menu.append(self._model_item)
+        # Model switcher submenu
+        model_menu_item = Gtk.MenuItem(label="Model")
+        model_submenu = Gtk.Menu()
+        active_profile = cfg.model_profile
+        for mid, mdata in self._controller.profiles.items():
+            downloaded = _is_model_downloaded(mid, self._controller.profiles)
+            label = mdata["name"]
+            if mid == active_profile:
+                label = f"\u2713 {label}"
+            elif not downloaded:
+                label = f"  {label} (not downloaded)"
+            else:
+                label = f"  {label}"
+            item = Gtk.MenuItem(label=label)
+            if downloaded and mid != active_profile:
+                item.connect("activate", self._on_switch_model, mid)
+            else:
+                item.set_sensitive(False)
+            model_submenu.append(item)
+        model_menu_item.set_submenu(model_submenu)
+        menu.append(model_menu_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -1317,6 +1437,14 @@ class TrayIcon:
 
         menu.show_all()
         self._indicator.set_menu(menu)
+
+    def _on_switch_model(self, _item, model_id):
+        new_config = self._controller.config
+        new_config.model_profile = model_id
+        self._controller.apply_config(new_config)
+        self._hotkey_mgr.rebuild(new_config)
+        self._build_menu()
+        self.update_ui()
 
     def _on_toggle(self, _item=None):
         self._controller.toggle()
