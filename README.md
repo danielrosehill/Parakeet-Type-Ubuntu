@@ -16,6 +16,10 @@ Whisper is excellent for batch transcription but has drawbacks for live dictatio
 
 The NeMo family (Parakeet, Canary, Nemotron) was designed for production speech pipelines and outputs punctuated text natively. Parakeet TDT 0.6B v3 achieves state-of-the-art word error rates on English benchmarks while running ~30x real-time on CPU.
 
+## Why sherpa-onnx?
+
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) provides a clean, optimized runtime for running ONNX-exported NeMo models. It handles feature extraction, decoding, and streaming — all in a single Python package with no external dependencies beyond ONNX Runtime. This avoids the overhead of full NeMo/PyTorch and enables efficient CPU-only inference even on laptops.
+
 ## Model Profiles
 
 | Profile | Model | Type | Params | Download | Best for |
@@ -26,7 +30,7 @@ The NeMo family (Parakeet, Canary, Nemotron) was designed for production speech 
 
 ### Model types explained
 
-- **Offline (VAD-segmented)**: Silero VAD detects when you pause speaking, then sends the completed speech segment to the model. You get punctuated text ~1–2 seconds after each pause. Best accuracy.
+- **Offline (VAD-segmented)**: TEN VAD detects when you pause speaking, then sends the completed speech segment to the model. You get punctuated text ~1–2 seconds after each pause. Best accuracy.
 - **Online (streaming)**: The model processes audio frame-by-frame as you speak, outputting partial results in real time. Lower latency, but slightly different sentence boundary behavior.
 
 All models output punctuated, capitalized text natively.
@@ -47,7 +51,7 @@ cd parakeet-dictation
 chmod +x build-deb.sh
 ./build-deb.sh
 
-sudo dpkg -i parakeet-dictation_0.1.0.deb
+sudo dpkg -i parakeet-dictation_1.0.0.deb
 sudo apt-get install -f          # resolve any missing deps
 sudo /opt/parakeet-dictation/setup-pip-deps.sh
 
@@ -71,9 +75,48 @@ python download_models.py streaming  # 631 MB — real-time
 python download_models.py all        # all profiles
 
 # System dependencies (Ubuntu/Debian)
-sudo apt install ydotool gir1.2-ayatanaappindicator3-0.1 libportaudio2 libgirepository-2.0-dev
+sudo apt install ydotool gir1.2-ayatanaappindicator3-0.1 libportaudio2 libgirepository-2.0-dev libc++1
 
 python dictation_app.py
+```
+
+### Wayland setup (important)
+
+On Wayland, text is typed into applications via **ydotool**, which requires access to `/dev/uinput`. This is the main installation friction point:
+
+```bash
+# Create the input group and add your user
+sudo groupadd -f input
+sudo usermod -aG input $USER
+
+# Set up udev rule for persistent permissions
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/80-uinput.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger /dev/uinput
+
+# Apply immediately (or log out and back in)
+sudo chmod 660 /dev/uinput
+sudo chgrp input /dev/uinput
+```
+
+**You must log out and back in** (or reboot) for the `input` group membership to take effect. Until then, you can use `sg input -c 'parakeet-dictation'` as a workaround.
+
+On X11, text entry uses **xdotool** instead and does not require uinput setup.
+
+### TEN VAD system dependency
+
+[TEN VAD](https://github.com/TEN-framework/ten-vad) requires `libc++1` (C++ standard library). The .deb package installs this automatically. If running from source:
+
+```bash
+sudo apt install libc++1
+```
+
+On some systems, the `libc++.so.1` symlink may be missing. If you get an error about `libc++.so.1`, create the symlink:
+
+```bash
+sudo ln -sf /lib/x86_64-linux-gnu/libc++.so.1.0.* /lib/x86_64-linux-gnu/libc++.so.1
+sudo ln -sf /lib/x86_64-linux-gnu/libc++abi.so.1.0.* /lib/x86_64-linux-gnu/libc++abi.so.1
+sudo ldconfig
 ```
 
 ## Usage
@@ -94,7 +137,7 @@ The app runs as a **system tray indicator**. Right-click the tray icon to access
 - **Toggle mode** (default): One key starts and stops dictation
 - **Start/Stop mode**: Separate keys for starting and stopping
 
-All hotkeys are rebindable from **Settings → Hotkeys**.
+All hotkeys are rebindable from **Settings → Hotkeys**. You can set any combination of hotkeys or use none (tray-only operation).
 
 ### Model manager
 
@@ -112,7 +155,7 @@ Automatically suppresses audio feedback between configurable hours (default 22:0
 
 ### How it works
 
-1. **Silero VAD** detects speech segments in real time
+1. **[TEN VAD](https://github.com/TEN-framework/ten-vad)** detects speech segments in real time (~306 KB, lightweight)
 2. When you pause speaking, the completed segment is sent to the ASR model
 3. Transcribed text (with punctuation) is typed into the focused window via **ydotool** (Wayland) or **xdotool** (X11), auto-detected
 
@@ -145,7 +188,8 @@ Settings stored in `~/.config/parakeet-dictation/config.json`:
 - Python 3.10+
 - Linux (validated on Ubuntu 25.04, KDE Plasma 6 / Wayland)
 - ~500 MB – 2 GB RAM depending on model
-- ydotool + ydotoold (Wayland) or xdotool (X11)
+- ydotool (Wayland) or xdotool (X11)
+- libc++1 (for TEN VAD)
 
 ## License
 

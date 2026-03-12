@@ -17,7 +17,7 @@ fi
 
 # Install/upgrade pip dependencies (PyGObject comes from system apt)
 "$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install sherpa-onnx sounddevice pynput numpy requests tqdm
+"$VENV_DIR/bin/pip" install sherpa-onnx sounddevice pynput numpy requests tqdm ten-vad
 
 # Make venv world-readable so any user can run the app
 chmod -R a+rX "$VENV_DIR"

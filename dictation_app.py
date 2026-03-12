@@ -18,6 +18,7 @@ from pathlib import Path
 import gi
 import numpy as np
 import sounddevice as sd
+from ten_vad import TenVad
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
@@ -172,6 +173,117 @@ class TextTyper:
 
 
 # ---------------------------------------------------------------------------
+# TEN VAD wrapper — lightweight voice activity detection (~306 KB)
+# Provides segment-based interface compatible with the ASR engine.
+# ---------------------------------------------------------------------------
+
+class _SpeechSegment:
+    """A completed speech segment with audio samples."""
+    __slots__ = ("samples",)
+
+    def __init__(self, samples: list[float]):
+        self.samples = samples
+
+
+class TenVadDetector:
+    """TEN VAD wrapper that accumulates speech and yields segments on silence."""
+
+    def __init__(self, threshold: float = 0.5, min_silence_duration: float = 0.25,
+                 min_speech_duration: float = 0.25, max_speech_duration: float = 30.0,
+                 sample_rate: int = 16000):
+        self._hop_size = 256  # ~16ms at 16kHz — TEN VAD optimal
+        self._threshold = threshold
+        self._sample_rate = sample_rate
+        self._min_silence_samples = int(min_silence_duration * sample_rate)
+        self._min_speech_samples = int(min_speech_duration * sample_rate)
+        self._max_speech_samples = int(max_speech_duration * sample_rate)
+
+        self._vad = TenVad(hop_size=self._hop_size, threshold=threshold)
+
+        # Internal state
+        self._buffer: list[float] = []  # float32 samples for ASR
+        self._int16_remainder = np.array([], dtype=np.int16)  # leftover for VAD
+        self._in_speech = False
+        self._speech_samples = 0
+        self._silence_samples = 0
+        self._segments: list[_SpeechSegment] = []
+        self._is_speech = False
+
+    def accept_waveform(self, samples: list[float]):
+        """Feed float32 audio samples (matching sounddevice output)."""
+        # Convert to int16 for TEN VAD
+        arr = np.array(samples, dtype=np.float32)
+        int16_data = (arr * 32767).astype(np.int16)
+
+        # Prepend any leftover from previous call
+        if len(self._int16_remainder) > 0:
+            int16_data = np.concatenate([self._int16_remainder, int16_data])
+
+        # Process in hop_size chunks
+        i = 0
+        while i + self._hop_size <= len(int16_data):
+            chunk = int16_data[i:i + self._hop_size]
+            prob, _flag = self._vad.process(chunk)
+            is_speech = prob >= self._threshold
+
+            float_chunk = samples[i:i + self._hop_size] if i + self._hop_size <= len(samples) else arr[i:i + self._hop_size].tolist()
+
+            if is_speech:
+                self._is_speech = True
+                self._silence_samples = 0
+                if not self._in_speech:
+                    self._in_speech = True
+                    self._speech_samples = 0
+                self._buffer.extend(float_chunk)
+                self._speech_samples += self._hop_size
+
+                # Force segment if max duration reached
+                if self._speech_samples >= self._max_speech_samples:
+                    self._emit_segment()
+            else:
+                if self._in_speech:
+                    self._buffer.extend(float_chunk)
+                    self._silence_samples += self._hop_size
+                    if self._silence_samples >= self._min_silence_samples:
+                        self._emit_segment()
+                else:
+                    self._is_speech = False
+
+            i += self._hop_size
+
+        # Save leftover
+        self._int16_remainder = int16_data[i:]
+
+    def _emit_segment(self):
+        """Finalize current speech buffer into a segment."""
+        if len(self._buffer) >= self._min_speech_samples:
+            self._segments.append(_SpeechSegment(list(self._buffer)))
+        self._buffer.clear()
+        self._in_speech = False
+        self._speech_samples = 0
+        self._silence_samples = 0
+        self._is_speech = False
+
+    def is_speech_detected(self) -> bool:
+        return self._is_speech
+
+    def empty(self) -> bool:
+        return len(self._segments) == 0
+
+    @property
+    def front(self) -> _SpeechSegment:
+        return self._segments[0]
+
+    def pop(self):
+        self._segments.pop(0)
+
+    def flush(self):
+        """Emit any remaining buffered speech."""
+        if self._buffer:
+            self._emit_segment()
+
+
+# ---------------------------------------------------------------------------
 # ASR Engine — supports offline (VAD-segmented) and streaming modes
 # ---------------------------------------------------------------------------
 
@@ -200,9 +312,6 @@ class ASREngine:
             fp = model_dir / info["filename"]
             if not fp.exists():
                 missing.append(info["filename"])
-        vad_path = MODELS_DIR / "silero_vad.onnx"
-        if not vad_path.exists():
-            missing.append("silero_vad.onnx")
         if missing:
             raise FileNotFoundError(
                 f"Missing model files: {', '.join(missing)}\n"
@@ -226,6 +335,19 @@ class ASREngine:
                 feature_dim=self._profile.get("feature_dim", 128),
                 provider="cpu",
                 model_type=self._profile.get("model_type", "nemo_transducer"),
+                decoding_method="greedy_search",
+            )
+        elif decoder_type == "canary":
+            return sherpa_onnx.OfflineRecognizer.from_nemo_canary(
+                encoder=str(model_dir / files["encoder"]["filename"]),
+                decoder=str(model_dir / files["decoder"]["filename"]),
+                tokens=str(model_dir / files["tokens"]["filename"]),
+                src_lang=self._profile.get("src_lang", "en"),
+                tgt_lang=self._profile.get("tgt_lang", "en"),
+                num_threads=self._config.num_threads,
+                sample_rate=SAMPLE_RATE,
+                feature_dim=self._profile.get("feature_dim", 128),
+                provider="cpu",
                 decoding_method="greedy_search",
             )
         else:
@@ -259,18 +381,13 @@ class ASREngine:
         )
 
     def _build_vad(self):
-        import sherpa_onnx
-        vad_config = sherpa_onnx.VadModelConfig(
-            sherpa_onnx.SileroVadModelConfig(
-                model=str(MODELS_DIR / "silero_vad.onnx"),
-                threshold=self._config.vad_threshold,
-                min_silence_duration=0.25,
-                min_speech_duration=0.25,
-                max_speech_duration=30.0,
-            ),
+        return TenVadDetector(
+            threshold=self._config.vad_threshold,
+            min_silence_duration=0.25,
+            min_speech_duration=0.25,
+            max_speech_duration=30.0,
             sample_rate=SAMPLE_RATE,
         )
-        return sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
 
     @property
     def is_running(self) -> bool:
@@ -623,8 +740,7 @@ def _is_model_downloaded(model_id: str, profiles: dict) -> bool:
     for key, info in profile.get("files", {}).items():
         if not (model_dir / info["filename"]).exists():
             return False
-    vad_path = MODELS_DIR / "silero_vad.onnx"
-    return vad_path.exists()
+    return True
 
 
 def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
@@ -636,17 +752,6 @@ def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
             profile = profiles_data["profiles"][model_id]
             model_dir = MODELS_DIR / model_id
             model_dir.mkdir(parents=True, exist_ok=True)
-
-            # Download VAD if missing
-            vad_path = MODELS_DIR / "silero_vad.onnx"
-            if not vad_path.exists():
-                GLib.idle_add(on_progress, "Downloading VAD model...")
-                vad = profiles_data["vad"]
-                resp = requests.get(vad["url"], stream=True, timeout=30)
-                resp.raise_for_status()
-                with open(vad_path, "wb") as f:
-                    for chunk in resp.iter_content(1024 * 1024):
-                        f.write(chunk)
 
             # Download model files
             files = profile["files"]

@@ -75,9 +75,6 @@ def main():
     if "all" in targets:
         targets = list(config["profiles"].keys())
 
-    # Always download VAD
-    download_vad(config)
-
     for t in targets:
         download_profile(config, t)
 
