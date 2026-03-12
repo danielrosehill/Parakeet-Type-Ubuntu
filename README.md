@@ -1,10 +1,12 @@
 # Parakeet Dictation
 
-On-device voice typing for Linux with **built-in punctuation and capitalization** — no cloud API, no GPU required.
+On-device voice typing for **Linux / Wayland** with **built-in punctuation and capitalization** — no cloud API, no GPU required.
 
 Uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) to run NVIDIA NeMo ASR models locally, including [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), one of the highest-accuracy open-source speech recognition models available. Unlike Whisper-based dictation tools, Parakeet produces **natively punctuated and capitalized** output with no post-processing — making it ideal for live typing workflows.
 
 Validated on **Ubuntu 25.04** with **KDE Plasma 6 / Wayland**.
+
+> **Note**: This is a Wayland-only tool. X11 is not supported.
 
 ## Why not Whisper?
 
@@ -75,33 +77,33 @@ python download_models.py streaming  # 631 MB — real-time
 python download_models.py all        # all profiles
 
 # System dependencies (Ubuntu/Debian)
-sudo apt install ydotool gir1.2-ayatanaappindicator3-0.1 libportaudio2 libgirepository-2.0-dev libc++1
+sudo apt install wtype gir1.2-ayatanaappindicator3-0.1 libportaudio2 libgirepository-2.0-dev libc++1
 
 python dictation_app.py
 ```
 
-### Wayland setup (important)
+### Text input method
 
-On Wayland, text is typed into applications via **ydotool**, which requires access to `/dev/uinput`. This is the main installation friction point:
+Text is typed into the focused application via **wtype** (Wayland-native). This is the default and recommended method.
+
+Alternative methods available in **Settings > General**:
+
+| Method | Command | Notes |
+|---|---|---|
+| **wtype** (default) | `wtype` | Native Wayland keystroke injection. Just works. |
+| **ydotool** | `ydotool` | Requires `ydotoold` daemon + `/dev/uinput` permissions (see below) |
+| **clipboard** | `wl-copy` + `wtype Ctrl+V` | Pastes via clipboard. Works everywhere but overwrites clipboard. |
+
+#### ydotool setup (only if using ydotool method)
 
 ```bash
-# Create the input group and add your user
 sudo groupadd -f input
 sudo usermod -aG input $USER
-
-# Set up udev rule for persistent permissions
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/80-uinput.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger /dev/uinput
-
-# Apply immediately (or log out and back in)
-sudo chmod 660 /dev/uinput
-sudo chgrp input /dev/uinput
+# Log out and back in for group membership to take effect
 ```
-
-**You must log out and back in** (or reboot) for the `input` group membership to take effect. Until then, you can use `sg input -c 'parakeet-dictation'` as a workaround.
-
-On X11, text entry uses **xdotool** instead and does not require uinput setup.
 
 ### TEN VAD system dependency
 
@@ -121,7 +123,10 @@ sudo ldconfig
 
 ## Usage
 
-The app runs as a **system tray indicator**. Right-click the tray icon to access Settings, switch models, or quit.
+The app runs as a **system tray indicator** with an optional **full-size main window**.
+
+- **Tray icon**: Right-click for start/stop, model switching, settings, and to open the main window.
+- **Main window**: Open from the tray menu ("Show Window"). Provides a transcript view, start/stop/pause controls, and a microphone selector. Closing the window hides it back to tray.
 
 ### Default hotkeys
 
@@ -137,11 +142,19 @@ The app runs as a **system tray indicator**. Right-click the tray icon to access
 - **Toggle mode** (default): One key starts and stops dictation
 - **Start/Stop mode**: Separate keys for starting and stopping
 
-All hotkeys are rebindable from **Settings → Hotkeys**. You can set any combination of hotkeys or use none (tray-only operation).
+All hotkeys are rebindable from **Settings > Hotkeys**.
+
+### Microphone selection
+
+Choose your input device from:
+- **Settings > General > Microphone** (persisted)
+- **Main window** header bar mic selector (quick switch)
+
+Leave set to "System Default" to use your desktop's default input device.
 
 ### Model manager
 
-Open **Settings → Models** to browse available model profiles, download them in-app, and select which one to use. The **About** tab has recommendations for choosing a model.
+Open **Settings > Models** to browse available model profiles, download them in-app, and select which one to use.
 
 ### Audio feedback
 
@@ -151,13 +164,13 @@ Open **Settings → Models** to browse available model profiles, download them i
 
 ### Night mode
 
-Automatically suppresses audio feedback between configurable hours (default 22:00–09:00). Enable from **Settings → General**.
+Automatically suppresses audio feedback between configurable hours (default 22:00–09:00). Enable from **Settings > General**.
 
 ### How it works
 
 1. **[TEN VAD](https://github.com/TEN-framework/ten-vad)** detects speech segments in real time (~306 KB, lightweight)
 2. When you pause speaking, the completed segment is sent to the ASR model
-3. Transcribed text (with punctuation) is typed into the focused window via **ydotool** (Wayland) or **xdotool** (X11), auto-detected
+3. Transcribed text (with punctuation) is typed into the focused window via **wtype**
 
 The streaming profile uses frame-by-frame processing instead of VAD segmentation.
 
@@ -171,7 +184,8 @@ Settings stored in `~/.config/parakeet-dictation/config.json`:
   "num_threads": 4,
   "vad_threshold": 0.5,
   "beep_volume": 0.5,
-  "typer": "ydotool",
+  "audio_device": "",
+  "typer": "wtype",
   "hotkey_mode": "toggle",
   "hotkey_toggle": "<ctrl>+0",
   "hotkey_start": "<ctrl>+9",
@@ -186,9 +200,9 @@ Settings stored in `~/.config/parakeet-dictation/config.json`:
 ## Requirements
 
 - Python 3.10+
-- Linux (validated on Ubuntu 25.04, KDE Plasma 6 / Wayland)
+- Linux with Wayland (validated on Ubuntu 25.04, KDE Plasma 6)
 - ~500 MB – 2 GB RAM depending on model
-- ydotool (Wayland) or xdotool (X11)
+- wtype (Wayland text input)
 - libc++1 (for TEN VAD)
 
 ## License

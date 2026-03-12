@@ -33,9 +33,35 @@ APP_ID = "parakeet-dictation"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
 APP_DIR = Path(__file__).resolve().parent
-MODELS_DIR = APP_DIR / "models"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_ID
+MODELS_DIR = DATA_DIR / "models"
 MODELS_JSON = APP_DIR / "models.json"
 SAMPLE_RATE = 16000
+
+
+def _migrate_legacy_models():
+    """Move models from APP_DIR/models to the XDG data directory if needed."""
+    import shutil
+
+    legacy = APP_DIR / "models"
+    if not legacy.is_dir() or legacy == MODELS_DIR:
+        return
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    for item in legacy.iterdir():
+        dest = MODELS_DIR / item.name
+        if dest.exists():
+            continue
+        try:
+            shutil.move(str(item), str(dest))
+        except OSError:
+            # Installed read-only — copy instead
+            if item.is_dir():
+                shutil.copytree(str(item), str(dest))
+            else:
+                shutil.copy2(str(item), str(dest))
+
+
+_migrate_legacy_models()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -51,9 +77,10 @@ class AppConfig:
 
     # Audio
     beep_volume: float = 0.5
+    audio_device: str = ""  # Empty = system default; otherwise device name or index
 
-    # Typing method: "ydotool" for Wayland, "xdotool" for X11
-    typer: str = "ydotool"
+    # Typing method: "wtype" (recommended), "ydotool" (needs daemon), "clipboard" (wl-copy+wtype paste)
+    typer: str = "wtype"
 
     # Hotkey mode: "toggle" (one key) or "start_stop" (separate keys)
     hotkey_mode: str = "toggle"
@@ -150,11 +177,37 @@ def play_beep_pause(volume: float = 0.5):
 
 
 # ---------------------------------------------------------------------------
+# Audio device helpers
+# ---------------------------------------------------------------------------
+
+def list_input_devices() -> list[dict]:
+    """Return a list of input-capable audio devices."""
+    result = []
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0:
+            result.append({"index": i, "name": dev["name"], "channels": dev["max_input_channels"]})
+    return result
+
+
+def resolve_audio_device(config_value: str):
+    """Convert config audio_device string to a sounddevice device index or None."""
+    if not config_value:
+        return None
+    try:
+        return int(config_value)
+    except ValueError:
+        for dev in list_input_devices():
+            if config_value in dev["name"]:
+                return dev["index"]
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Text typer
 # ---------------------------------------------------------------------------
 
 class TextTyper:
-    def __init__(self, method: str = "ydotool"):
+    def __init__(self, method: str = "wtype"):
         self._method = method
 
     def type_text(self, text: str):
@@ -162,15 +215,17 @@ class TextTyper:
         if not text:
             return
         try:
-            if self._method == "ydotool":
+            if self._method == "wtype":
+                subprocess.run(["wtype", "--", text + " "], timeout=5)
+            elif self._method == "ydotool":
                 subprocess.run(["ydotool", "type", "--", text + " "], timeout=5)
+            elif self._method == "clipboard":
+                subprocess.run(["wl-copy", "--", text + " "], timeout=5)
+                subprocess.run(["wtype", "-M", "ctrl", "v", "-m", "ctrl"], timeout=5)
             else:
-                subprocess.run(
-                    ["xdotool", "type", "--clearmodifiers", "--", text + " "],
-                    timeout=5,
-                )
+                subprocess.run(["wtype", "--", text + " "], timeout=5)
         except FileNotFoundError:
-            print(f"ERROR: {self._method} not found.", file=sys.stderr)
+            print(f"ERROR: {self._method} not found. Install wtype: sudo apt install wtype", file=sys.stderr)
         except subprocess.TimeoutExpired:
             pass
 
@@ -460,8 +515,9 @@ class ASREngine:
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
 
+        device = resolve_audio_device(self._config.audio_device)
         with sd.InputStream(
-            channels=1, dtype="float32", samplerate=SAMPLE_RATE,
+            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
             blocksize=samples_per_chunk,
         ) as stream:
             play_beep_start(self._config.beep_volume)
@@ -511,8 +567,9 @@ class ASREngine:
         chunk_duration = 0.1
         samples_per_chunk = int(SAMPLE_RATE * chunk_duration)
 
+        device = resolve_audio_device(self._config.audio_device)
         with sd.InputStream(
-            channels=1, dtype="float32", samplerate=SAMPLE_RATE,
+            device=device, channels=1, dtype="float32", samplerate=SAMPLE_RATE,
             blocksize=samples_per_chunk,
         ) as mic:
             play_beep_start(self._config.beep_volume)
@@ -556,6 +613,7 @@ class DictationController:
         self._profiles_data = load_model_profiles()
         self._engine = None
         self._status_callback = None
+        self._transcript_callback = None
         self._rebuild_engine()
 
     def _rebuild_engine(self):
@@ -571,6 +629,9 @@ class DictationController:
 
     def set_status_callback(self, cb):
         self._status_callback = cb
+
+    def set_transcript_callback(self, cb):
+        self._transcript_callback = cb
 
     @property
     def is_running(self) -> bool:
@@ -623,6 +684,8 @@ class DictationController:
 
     def _on_final_text(self, text: str):
         self._typer.type_text(text)
+        if self._transcript_callback:
+            self._transcript_callback(text)
         if self._status_callback:
             self._status_callback("")
 
@@ -754,15 +817,56 @@ def _is_model_downloaded(model_id: str, profiles: dict) -> bool:
     return True
 
 
+def _download_file(url: str, dest: Path, on_progress_bytes=None):
+    """Download a single file with progress reporting. Raises on failure."""
+    import requests
+
+    resp = requests.get(url, stream=True, timeout=(15, 60))
+    resp.raise_for_status()
+    total = int(resp.headers.get("content-length", 0))
+    downloaded = 0
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if on_progress_bytes:
+                    on_progress_bytes(downloaded, total)
+        tmp.rename(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _ensure_vad(profiles_data: dict, on_progress_bytes=None):
+    """Download the VAD model if not present."""
+    vad = profiles_data.get("vad")
+    if not vad:
+        return
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = MODELS_DIR / vad["filename"]
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+    _download_file(vad["url"], dest, on_progress_bytes)
+
+
 def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
     """Download a model in a background thread."""
-    import requests
 
     def _worker():
         try:
             profile = profiles_data["profiles"][model_id]
             model_dir = MODELS_DIR / model_id
             model_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download VAD first
+            def _vad_progress(done, total):
+                if total:
+                    mb = done / 1024 / 1024
+                    total_mb = total / 1024 / 1024
+                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
+            _ensure_vad(profiles_data, _vad_progress)
 
             # Download model files
             files = profile["files"]
@@ -771,12 +875,22 @@ def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
                 dest = model_dir / info["filename"]
                 if dest.exists() and dest.stat().st_size > 0:
                     continue
-                GLib.idle_add(on_progress, f"Downloading {info['filename']} ({i}/{total_files})...")
-                resp = requests.get(info["url"], stream=True, timeout=30)
-                resp.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in resp.iter_content(1024 * 1024):
-                        f.write(chunk)
+
+                def _file_progress(done, total, fname=info["filename"], idx=i):
+                    if total:
+                        frac = done / total
+                        mb = done / 1024 / 1024
+                        total_mb = total / 1024 / 1024
+                        GLib.idle_add(
+                            on_progress,
+                            f"{fname} ({idx}/{total_files}): {mb:.0f}/{total_mb:.0f} MB",
+                            frac,
+                        )
+                    else:
+                        mb = done / 1024 / 1024
+                        GLib.idle_add(on_progress, f"{fname}: {mb:.0f} MB", -1.0)
+
+                _download_file(info["url"], dest, _file_progress)
 
             GLib.idle_add(on_done, True, "")
         except Exception as e:
@@ -787,10 +901,17 @@ def _download_model(model_id: str, profiles_data: dict, on_progress, on_done):
 
 def _download_all_models(profiles_data: dict, on_progress, on_done):
     """Download all models sequentially in a background thread."""
-    import requests
 
     def _worker():
         try:
+            # Download VAD first
+            def _vad_progress(done, total):
+                if total:
+                    mb = done / 1024 / 1024
+                    total_mb = total / 1024 / 1024
+                    GLib.idle_add(on_progress, f"VAD: {mb:.0f}/{total_mb:.0f} MB", -1.0)
+            _ensure_vad(profiles_data, _vad_progress)
+
             profiles = profiles_data["profiles"]
             for mid, profile in profiles.items():
                 model_dir = MODELS_DIR / mid
@@ -801,15 +922,19 @@ def _download_all_models(profiles_data: dict, on_progress, on_done):
                     dest = model_dir / info["filename"]
                     if dest.exists() and dest.stat().st_size > 0:
                         continue
-                    GLib.idle_add(
-                        on_progress,
-                        f"{profile['name'][:20]}: {info['filename']} ({i}/{total_files})",
-                    )
-                    resp = requests.get(info["url"], stream=True, timeout=30)
-                    resp.raise_for_status()
-                    with open(dest, "wb") as f:
-                        for chunk in resp.iter_content(1024 * 1024):
-                            f.write(chunk)
+                    short_name = profile["name"][:18]
+
+                    def _file_progress(done, total, sn=short_name, fname=info["filename"], idx=i, tf=total_files):
+                        if total:
+                            frac = done / total
+                            mb = done / 1024 / 1024
+                            total_mb = total / 1024 / 1024
+                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f}/{total_mb:.0f} MB", frac)
+                        else:
+                            mb = done / 1024 / 1024
+                            GLib.idle_add(on_progress, f"{sn}: {fname} {mb:.0f} MB", -1.0)
+
+                    _download_file(info["url"], dest, _file_progress)
             GLib.idle_add(on_done, True, "")
         except Exception as e:
             GLib.idle_add(on_done, False, str(e))
@@ -938,19 +1063,39 @@ class WelcomeDialog(Gtk.Dialog):
         dl_all_btn.connect("clicked", self._on_download_all)
         box.pack_start(dl_all_btn, False, False, 0)
 
+        # Progress bar (hidden until download starts)
+        self._progress_bar = Gtk.ProgressBar()
+        self._progress_bar.set_show_text(True)
+        self._progress_bar.set_no_show_all(True)
+        box.pack_start(self._progress_bar, False, False, 0)
+
+        # Error label (hidden until error)
+        self._error_label = Gtk.Label()
+        self._error_label.set_line_wrap(True)
+        self._error_label.set_max_width_chars(60)
+        self._error_label.set_halign(Gtk.Align.START)
+        self._error_label.set_no_show_all(True)
+        box.pack_start(self._error_label, False, False, 0)
+
         self.show_all()
+
+    def _update_progress(self, msg, fraction):
+        self._progress_bar.set_text(msg)
+        if fraction >= 0:
+            self._progress_bar.set_fraction(min(fraction, 1.0))
+        else:
+            self._progress_bar.pulse()
 
     def _on_download_all(self, btn):
         btn.set_sensitive(False)
-        label = btn.get_children()[0].get_children()[1]
-        label.set_text("Downloading...")
+        self._progress_bar.show()
+        self._error_label.hide()
 
-        def on_progress(msg):
-            label.set_text(msg[:40])
+        def on_progress(msg, fraction):
+            self._update_progress(msg, fraction)
 
         def on_done(success, err):
             if success:
-                # Pick the best default — laptop if available
                 self._config.model_profile = "laptop"
                 self._config.save()
                 self.destroy()
@@ -958,18 +1103,20 @@ class WelcomeDialog(Gtk.Dialog):
                     self._on_model_ready(self._config)
             else:
                 btn.set_sensitive(True)
-                label.set_text("Retry Download All")
+                self._progress_bar.hide()
+                self._error_label.set_markup(f"<span color='red'>Download failed: {GLib.markup_escape_text(err)}</span>")
+                self._error_label.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_all_models(self._profiles_data, on_progress, on_done)
 
     def _on_download(self, _btn, model_id, btn_widget):
         btn_widget.set_sensitive(False)
-        btn_widget.get_children()[0].get_children()[1].set_text("...")
+        self._progress_bar.show()
+        self._error_label.hide()
 
-        def on_progress(msg):
-            label = btn_widget.get_children()[0].get_children()[1]
-            label.set_text(msg[:18])
+        def on_progress(msg, fraction):
+            self._update_progress(msg, fraction)
 
         def on_done(success, err):
             if success:
@@ -980,7 +1127,9 @@ class WelcomeDialog(Gtk.Dialog):
                     self._on_model_ready(self._config)
             else:
                 btn_widget.set_sensitive(True)
-                btn_widget.get_children()[0].get_children()[1].set_text("Retry")
+                self._progress_bar.hide()
+                self._error_label.set_markup(f"<span color='red'>Download failed: {GLib.markup_escape_text(err)}</span>")
+                self._error_label.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_model(model_id, self._profiles_data, on_progress, on_done)
@@ -1039,6 +1188,20 @@ class SettingsDialog(Gtk.Dialog):
         self._dl_all_btn.add(dl_all_hbox)
         self._dl_all_btn.connect("clicked", self._on_download_all)
         box.pack_start(self._dl_all_btn, False, False, 0)
+
+        # Progress bar (hidden until download starts)
+        self._dl_progress = Gtk.ProgressBar()
+        self._dl_progress.set_show_text(True)
+        self._dl_progress.set_no_show_all(True)
+        box.pack_start(self._dl_progress, False, False, 0)
+
+        # Error label (hidden until error)
+        self._dl_error = Gtk.Label()
+        self._dl_error.set_line_wrap(True)
+        self._dl_error.set_max_width_chars(60)
+        self._dl_error.set_halign(Gtk.Align.START)
+        self._dl_error.set_no_show_all(True)
+        box.pack_start(self._dl_error, False, False, 0)
 
         self._populate_models()
         return box
@@ -1135,37 +1298,50 @@ class SettingsDialog(Gtk.Dialog):
             self._on_save(self._config)
         self._populate_models()
 
+    def _update_dl_progress(self, msg, fraction):
+        self._dl_progress.set_text(msg)
+        if fraction >= 0:
+            self._dl_progress.set_fraction(min(fraction, 1.0))
+        else:
+            self._dl_progress.pulse()
+
     def _on_download_model(self, _btn, model_id, btn_widget):
         btn_widget.set_sensitive(False)
-        btn_widget.set_label("...")
+        self._dl_progress.show()
+        self._dl_error.hide()
 
-        def on_progress(msg):
-            btn_widget.set_label(msg[:20])
+        def on_progress(msg, fraction):
+            self._update_dl_progress(msg, fraction)
 
         def on_done(success, err):
+            self._dl_progress.hide()
             if success:
                 self._populate_models()
             else:
-                btn_widget.set_label("Failed")
                 btn_widget.set_sensitive(True)
+                self._dl_error.set_markup(f"<span color='red'>Download failed: {GLib.markup_escape_text(err)}</span>")
+                self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_model(model_id, self._profiles_data, on_progress, on_done)
 
     def _on_download_all(self, _btn):
         self._dl_all_btn.set_sensitive(False)
-        self._dl_all_label.set_text("Downloading...")
+        self._dl_progress.show()
+        self._dl_error.hide()
 
-        def on_progress(msg):
-            self._dl_all_label.set_text(msg[:40])
+        def on_progress(msg, fraction):
+            self._update_dl_progress(msg, fraction)
 
         def on_done(success, err):
+            self._dl_progress.hide()
             if success:
                 self._dl_all_label.set_text("All models downloaded")
                 self._populate_models()
             else:
                 self._dl_all_btn.set_sensitive(True)
-                self._dl_all_label.set_text("Retry Download All")
+                self._dl_error.set_markup(f"<span color='red'>Download failed: {GLib.markup_escape_text(err)}</span>")
+                self._dl_error.show()
                 print(f"Download error: {err}", file=sys.stderr)
 
         _download_all_models(self._profiles_data, on_progress, on_done)
@@ -1244,6 +1420,33 @@ class SettingsDialog(Gtk.Dialog):
         box.set_margin_top(12)
         box.set_margin_bottom(12)
 
+        # Microphone selector
+        hbox_mic = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_mic.pack_start(Gtk.Label(label="Microphone:"), False, False, 0)
+        self._mic_combo = Gtk.ComboBoxText()
+        self._mic_combo.append("", "System Default")
+        devices = list_input_devices()
+        for dev in devices:
+            self._mic_combo.append(str(dev["index"]), dev["name"])
+        self._mic_combo.set_active_id(self._config.audio_device or "")
+        hbox_mic.pack_start(self._mic_combo, True, True, 0)
+        box.pack_start(hbox_mic, False, False, 0)
+
+        # Typing method
+        hbox_typer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox_typer.pack_start(Gtk.Label(label="Typing method:"), False, False, 0)
+        self._typer_combo = Gtk.ComboBoxText()
+        self._typer_combo.append("wtype", "wtype (recommended)")
+        self._typer_combo.append("ydotool", "ydotool (needs daemon)")
+        self._typer_combo.append("clipboard", "Clipboard paste (wl-copy)")
+        self._typer_combo.set_active_id(self._config.typer)
+        hbox_typer.pack_start(self._typer_combo, False, False, 0)
+        box.pack_start(hbox_typer, False, False, 0)
+
+        sep0 = Gtk.Separator()
+        sep0.set_margin_top(4)
+        box.pack_start(sep0, False, False, 0)
+
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox.pack_start(Gtk.Label(label="Beep volume:"), False, False, 0)
         self._vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
@@ -1302,6 +1505,8 @@ class SettingsDialog(Gtk.Dialog):
 
     def _save_general(self, _btn):
         global _active_config
+        self._config.audio_device = self._mic_combo.get_active_id() or ""
+        self._config.typer = self._typer_combo.get_active_id() or "wtype"
         self._config.beep_volume = self._vol_scale.get_value()
         self._config.num_threads = int(self._threads_spin.get_value())
         self._config.language = self._lang_combo.get_active_id() or "en"
@@ -1363,13 +1568,171 @@ class SettingsDialog(Gtk.Dialog):
 
 
 # ---------------------------------------------------------------------------
+# Main window (undockable full-size UI)
+# ---------------------------------------------------------------------------
+
+class MainWindow(Gtk.Window):
+    def __init__(self, controller: DictationController, hotkey_mgr: HotkeyManager):
+        super().__init__(title=APP_NAME)
+        self._controller = controller
+        self._hotkey_mgr = hotkey_mgr
+        self.set_default_size(600, 450)
+        self.set_icon_name("audio-input-microphone")
+        self.connect("delete-event", self._on_delete)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # --- Header bar with controls ---
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_start(12)
+        header.set_margin_end(12)
+        header.set_margin_top(8)
+        header.set_margin_bottom(8)
+
+        self._toggle_btn = Gtk.Button()
+        self._toggle_btn.get_style_context().add_class("suggested-action")
+        self._toggle_btn.connect("clicked", self._on_toggle)
+        header.pack_start(self._toggle_btn, False, False, 0)
+
+        self._pause_btn = Gtk.Button(label="Pause")
+        self._pause_btn.set_sensitive(False)
+        self._pause_btn.connect("clicked", lambda _: self._controller.pause())
+        header.pack_start(self._pause_btn, False, False, 0)
+
+        self._status_label = Gtk.Label(label="Idle")
+        self._status_label.set_halign(Gtk.Align.START)
+        self._status_label.set_hexpand(True)
+        self._status_label.set_margin_start(12)
+        header.pack_start(self._status_label, True, True, 0)
+
+        # Microphone selector in header
+        self._mic_combo = Gtk.ComboBoxText()
+        self._mic_combo.append("", "Default mic")
+        for dev in list_input_devices():
+            self._mic_combo.append(str(dev["index"]), dev["name"])
+        self._mic_combo.set_active_id(self._controller.config.audio_device or "")
+        self._mic_combo.connect("changed", self._on_mic_changed)
+        header.pack_end(self._mic_combo, False, False, 0)
+        header.pack_end(Gtk.Label(label="Mic:"), False, False, 0)
+
+        vbox.pack_start(header, False, False, 0)
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+
+        # --- Transcript area ---
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_vexpand(True)
+
+        self._textview = Gtk.TextView()
+        self._textview.set_editable(False)
+        self._textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._textview.set_left_margin(12)
+        self._textview.set_right_margin(12)
+        self._textview.set_top_margin(8)
+        self._textview.set_bottom_margin(8)
+        self._textbuf = self._textview.get_buffer()
+        sw.add(self._textview)
+        vbox.pack_start(sw, True, True, 0)
+
+        # --- Bottom bar ---
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bottom.set_margin_start(12)
+        bottom.set_margin_end(12)
+        bottom.set_margin_top(6)
+        bottom.set_margin_bottom(6)
+
+        clear_btn = Gtk.Button(label="Clear")
+        clear_btn.connect("clicked", lambda _: self._textbuf.set_text(""))
+        bottom.pack_start(clear_btn, False, False, 0)
+
+        copy_btn = Gtk.Button(label="Copy All")
+        copy_btn.connect("clicked", self._on_copy_all)
+        bottom.pack_start(copy_btn, False, False, 0)
+
+        self._model_label = Gtk.Label()
+        self._model_label.set_halign(Gtk.Align.END)
+        self._model_label.get_style_context().add_class("dim-label")
+        bottom.pack_end(self._model_label, False, False, 0)
+
+        vbox.pack_start(bottom, False, False, 0)
+
+        self._update_controls()
+
+    def _on_delete(self, _win, _event):
+        self.hide()
+        return True  # Don't destroy, just hide
+
+    def _on_toggle(self, _btn):
+        self._controller.toggle()
+        self._update_controls()
+
+    def _on_mic_changed(self, combo):
+        dev_id = combo.get_active_id() or ""
+        cfg = self._controller.config
+        cfg.audio_device = dev_id
+        cfg.save()
+
+    def _on_copy_all(self, _btn):
+        start, end = self._textbuf.get_bounds()
+        text = self._textbuf.get_text(start, end, False)
+        if text:
+            subprocess.run(["wl-copy", "--", text], timeout=5)
+
+    def _update_controls(self):
+        running = self._controller.is_running
+        paused = self._controller.is_paused
+        cfg = self._controller.config
+
+        if running:
+            if paused:
+                self._toggle_btn.set_label("Resume")
+                self._status_label.set_text("Paused")
+            else:
+                self._toggle_btn.set_label("Stop")
+                self._status_label.set_text("Listening...")
+            self._pause_btn.set_sensitive(True)
+        else:
+            self._toggle_btn.set_label("Start Dictation")
+            self._status_label.set_text("Idle")
+            self._pause_btn.set_sensitive(False)
+
+        profile_name = self._controller.profiles.get(
+            cfg.model_profile, {}
+        ).get("name", cfg.model_profile)
+        self._model_label.set_markup(f"<small>{profile_name}</small>")
+
+    def on_status_update(self, text: str):
+        """Called by the controller status callback (on the GTK main thread)."""
+        self._update_controls()
+        if text and text not in ("Listening...", "Ready", "Resumed", "Paused"):
+            display = text[:80] + "\u2026" if len(text) > 80 else text
+            self._status_label.set_text(f"\u25b6 {display}")
+
+    def append_transcript(self, text: str):
+        """Append final transcribed text to the transcript view."""
+        end_iter = self._textbuf.get_end_iter()
+        existing = self._textbuf.get_char_count()
+        if existing > 0:
+            self._textbuf.insert(end_iter, " ")
+            end_iter = self._textbuf.get_end_iter()
+        self._textbuf.insert(end_iter, text)
+        # Auto-scroll to bottom
+        mark = self._textbuf.get_insert()
+        self._textbuf.place_cursor(self._textbuf.get_end_iter())
+        self._textview.scroll_mark_onscreen(mark)
+
+
+# ---------------------------------------------------------------------------
 # System tray
 # ---------------------------------------------------------------------------
 
 class TrayIcon:
-    def __init__(self, controller: DictationController, hotkey_mgr: HotkeyManager):
+    def __init__(self, controller: DictationController, hotkey_mgr: HotkeyManager,
+                 main_window: MainWindow):
         self._controller = controller
         self._hotkey_mgr = hotkey_mgr
+        self._main_window = main_window
 
         self._indicator = AyatanaAppIndicator3.Indicator.new(
             APP_ID,
@@ -1385,6 +1748,12 @@ class TrayIcon:
     def _build_menu(self):
         menu = Gtk.Menu()
         cfg = self._controller.config
+
+        show_window_item = Gtk.MenuItem(label="Show Window")
+        show_window_item.connect("activate", lambda _: self._main_window.present())
+        menu.append(show_window_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
 
         self._toggle_item = Gtk.MenuItem(label=f"Start Dictation ({cfg.hotkey_toggle})")
         self._toggle_item.connect("activate", self._on_toggle)
@@ -1473,6 +1842,7 @@ class TrayIcon:
 
     def _on_status_update(self, text: str):
         self.update_ui()
+        self._main_window.on_status_update(text)
         if text:
             display = text[:60] + "\u2026" if len(text) > 60 else text
             self._status_item.set_label(f"\u25b6 {display}")
@@ -1509,12 +1879,9 @@ def main():
     config = AppConfig.load()
     _active_config = config
 
-    # Auto-detect Wayland vs X11
-    session = os.environ.get("XDG_SESSION_TYPE", "")
-    if session == "wayland":
-        config.typer = "ydotool"
-    elif session == "x11":
-        config.typer = "xdotool"
+    # Ensure typer is a valid Wayland method
+    if config.typer not in ("wtype", "ydotool", "clipboard"):
+        config.typer = "wtype"
 
     controller = DictationController(config)
 
@@ -1529,7 +1896,10 @@ def main():
         on_pause=lambda: controller.pause(),
     )
 
-    tray = TrayIcon(controller, hotkey_mgr)
+    main_window = MainWindow(controller, hotkey_mgr)
+    controller.set_transcript_callback(main_window.append_transcript)
+
+    tray = TrayIcon(controller, hotkey_mgr, main_window)
     hotkey_mgr.start()
 
     signal.signal(signal.SIGINT, lambda *_: (controller.stop(), Gtk.main_quit()))

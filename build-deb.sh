@@ -3,7 +3,7 @@
 # Usage: ./build-deb.sh
 set -e
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PKG_NAME="parakeet-dictation"
 BUILD_DIR="$(mktemp -d)"
 PKG_DIR="$BUILD_DIR/${PKG_NAME}_${VERSION}"
@@ -23,7 +23,7 @@ Version: ${VERSION}
 Section: sound
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10), python3-gi, python3-numpy, gir1.2-ayatanaappindicator3-0.1, libportaudio2, python3-venv, ydotool, libc++1
+Depends: python3 (>= 3.10), python3-gi, python3-numpy, gir1.2-ayatanaappindicator3-0.1, libportaudio2, python3-venv, wtype, wl-clipboard, libc++1
 Maintainer: Daniel Rosehill <daniel@danielrosehill.co.il>
 Homepage: https://github.com/danielrosehill/parakeet-dictation
 Description: On-device voice typing using Parakeet and NeMo ASR models
